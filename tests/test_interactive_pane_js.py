@@ -1437,6 +1437,109 @@ def test_accepted_tool_event_recorded_only_when_painted() -> None:
     assert gate < record
 
 
+def test_compact_presentation_live_replay_and_lifecycle_wiring() -> None:
+    """The interactive renderer owns settlement timing and late blockers.
+
+    Shared DOM tests cover the fold state machine itself; this pins the pane's
+    load-bearing call order so effect/error truth is present before settlement,
+    replay stays silent, and teardown releases the registered scroller.
+    """
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    for symbol in (
+        "canAutoFoldTranscriptBatch",
+        "clearConvVerdictPending",
+        "getTranscriptPresentation",
+        "preserveTranscriptBottomPin",
+        "registerTranscriptScroller",
+        "markConvRowResultSettled",
+        "setReasoningActivity",
+        "setConvBatchExpanded",
+    ):
+        assert symbol in body
+
+    live = _extract_braced(
+        body,
+        "  appendToolOutput(callId, name, output, isError, preview, opts = {}) {",
+    )
+    settle = live.index("markConvRowResultSettled(target")
+    assert live.index("clearConvVerdictPending(target)") < settle
+    assert live.index("setToolOutputReviewState(target, output)") < settle
+    assert live.index("target.dataset.effectStatus") < settle
+    assert live.index("this._markAgentStepExceptional(") < settle
+    assert live.index('parentBlock.classList.add("conv-batch--error")') < settle
+    assert "const allowAutoFold" in live
+    assert "canAutoFoldTranscriptBatch(" in live
+    assert "_batchLiesBelowViewport" not in body
+    assert settle < live.index('toolAnnounce("Completed: "')
+    assert "settlement.autoFolded" in live
+
+    replay = _extract_braced(body, "  replayHistory(messages) {")
+    replay_settle = replay.index("markConvRowResultSettled(resultTarget")
+    assert replay.index("setToolOutputReviewState(resultTarget, msg.content)") < replay_settle
+    assert replay.index("resultTarget.dataset.effectStatus") < replay_settle
+    assert replay.index('lastToolBlock.classList.add("conv-batch--error")') < replay_settle
+    assert replay.index("_buildOutputWarningEl(assessment.assessment)") < replay_settle
+    assert 'toolAnnounce("Completed: "' not in replay
+
+    upgrade = _extract_braced(
+        body,
+        "  showInlineToolBlock(items, autoApproved, judgePending, cycleId) {",
+    )
+    reset = upgrade.index("announced.replaceChildren()")
+    assert reset < upgrade.index("delete announced.dataset.resultsSettled")
+    assert reset < upgrade.index("delete announced.dataset.compactFolded")
+
+    warning = _extract_braced(body, "  showOutputWarning(evt) {")
+    assert warning.index("setConvBatchExpanded(") < warning.index("_buildOutputWarningEl(")
+    verdict = _extract_braced(body, "  updateVerdictBadge(verdict) {")
+    pin = verdict.index("preserveTranscriptBottomPin(")
+    assert pin < verdict.index("setConvBatchExpanded(") < verdict.index("badge.replaceWith(")
+    nested = _extract_braced(
+        body,
+        "  _routeAgentItems(items, mode, judgePending, cycleId) {",
+    )
+    assert nested.index("setConvBatchExpanded(") < nested.index("row.appendChild(actions)")
+    assert "this._markAgentStepExceptional(row" in nested
+
+    replay_agent = _extract_braced(body, "  _replayAgentCard(row, steps) {")
+    assert "const stepRow = buildToolDiv(" in replay_agent
+    assert "this._markAgentStepExceptional(stepRow" in replay_agent
+    assert "effectStatus: step.effect_status" in replay_agent
+    assert "exceptional: !!step.contains_exceptional" in replay_agent
+
+    marker = _extract_braced(body, "  _markAgentStepExceptional(row, details) {")
+    assert "!details.isError" in marker
+    assert "!details.denied" in marker
+    assert "!details.exceptional" in marker
+    assert 'effectStatus === "committed"' in marker
+    assert 'card.dataset.agentStepExceptional = "true";' in marker
+    assert "issue.hidden = false;" in marker
+    assert marker.index("setConvBatchExpanded(") < marker.index(
+        'card.dataset.agentStepExceptional = "true";'
+    )
+
+    resolution = _extract_braced(
+        body,
+        "  resolveApproval(approved, always, feedback, skipPost, cycleId) {",
+    )
+    marker_call = resolution.index("this._markAgentStepExceptional(")
+    assert marker_call < resolution.index("buildConvStatus(")
+
+    assert "this._unregisterTranscriptScroller = registerTranscriptScroller(" in body
+    cleanup = body.index("if (pane._unregisterTranscriptScroller) {")
+    assert cleanup < body.index("pane._unregisterTranscriptScroller();", cleanup)
+
+    reasoning_case = body[body.index('case "reasoning"') : body.index('case "content"')]
+    assert "setReasoningActivity(this.currentReasoningEl, true)" in reasoning_case
+    assert 'reasoningBody.className = "msg-body"' in reasoning_case
+    assert "reasoningBody.textContent += evt.text" in reasoning_case
+    assert "this.currentReasoningEl.textContent += evt.text" not in reasoning_case
+    content_case = body[body.index('case "content"') : body.index('case "stream_end"')]
+    assert "setReasoningActivity(this.currentReasoningEl, false)" in content_case
+    stream_case = body[body.index('case "stream_end"') : body.index('case "in_progress_snapshot"')]
+    assert "setReasoningActivity(this.currentReasoningEl, false)" in stream_case
+
+
 def test_task_agent_context_badge_is_keyed_idempotent_and_terminal_safe() -> None:
     """Live and synthetic readings share one keyed reducer.
 
@@ -1454,8 +1557,17 @@ def test_task_agent_context_badge_is_keyed_idempotent_and_terminal_safe() -> Non
         )
     ]
     assert "this._agentContexts.set(parentId, { promptTokens, contextWindow });" in update
-    assert "terminal.row === parentRow" in update
+    assert "this._agentTransientRoute(parentId)" in update
     assert "this._ensureAgentCard(parentId, true)" in update
+
+    route = body[
+        body.index("_agentTransientRoute(parentId) {") : body.index(
+            "_handleAgentCompaction(evt) {", body.index("_agentTransientRoute(parentId) {")
+        )
+    ]
+    assert "terminal.row !== parentRow" in route
+    assert 'state: "blocked"' in route
+    assert 'state: "drop"' in route
 
     relink = body[
         body.index("_relinkAgentCards(items) {") : body.index(
@@ -1485,9 +1597,10 @@ def test_task_agent_context_badge_is_keyed_idempotent_and_terminal_safe() -> Non
     assert '"Warning: " + context.title' in accessible
     assert 'label.textContent || "0 steps"' in accessible
 
-    assert "blockedByTerminalRow: parentRow" in update
+    assert "blockedByTerminalRow: route.row" in update
     state_case = body[body.index('case "state_change":') : body.index('case "tool_pending":')]
     assert "reading.blockedByTerminalRow" in state_case
+    assert "holder.blockedByTerminalRow" in state_case
 
     result = body[
         body.index("appendToolOutput(callId") : body.index(
@@ -1506,6 +1619,238 @@ def test_task_agent_context_badge_is_keyed_idempotent_and_terminal_safe() -> Non
     ]
     assert "delete card.wrap.dataset.contextOnly;" in route
     assert "card.wrap.hidden = false;" in route
+
+
+def test_task_agent_compaction_is_buffered_nested_and_terminal_safe() -> None:
+    """Targeted compaction follows the parent task-card lifecycle."""
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    handler = body[
+        body.index("_handleAgentCompaction(evt) {") : body.index(
+            "_routeAgentItems(items", body.index("_handleAgentCompaction(evt) {")
+        )
+    ]
+    assert "this._agentCompactions.set(parentId, holder);" in handler
+    assert 'if (evt.phase === "end") return;' in handler
+    assert "incomingCid !== activeCid" in handler
+    assert "holder.pending = evt;" in handler
+    assert "this._agentTransientRoute(parentId)" in handler
+    assert "holder.blockedByTerminalRow = route.row" in handler
+    assert "renderResult: false" in handler
+    assert "card.wrap.insertBefore(node, card.body)" in handler
+    assert 'notice.className = "conv-agent-compaction-notice"' in handler
+    assert "this._agentCompactions.delete(parentId);" in handler
+
+    relink = body[
+        body.index("_relinkAgentCards(items) {") : body.index(
+            "_updateAgentLabel(", body.index("_relinkAgentCards(items) {")
+        )
+    ]
+    assert "this._agentCompactions.has(it.call_id)" in relink
+
+    result = body[
+        body.index("appendToolOutput(callId") : body.index(
+            "sendMessage() {", body.index("appendToolOutput(callId")
+        )
+    ]
+    assert "this._agentCompactions.delete(callId);" in result
+    assert "resetCompactionHolder(this._agentCompactions.get(callId))" in result
+
+    clear = body[
+        body.index("_clearAgentTracking() {") : body.index(
+            "_recordTruncatedGap()", body.index("_clearAgentTracking() {")
+        )
+    ]
+    assert "for (const holder of this._agentCompactions.values())" in clear
+    assert "this._agentCompactions.clear();" in clear
+
+
+def test_task_agent_compaction_handler_preserves_newer_attempt(tmp_path: Path) -> None:
+    """Execute the pane wrapper, not only the shared lifecycle reducer.
+
+    A stale end must neither clear a newer holder nor create an empty task card
+    when no local attempt exists.
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node binary not available on PATH")
+
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    handler = _extract_braced(body, "  _handleAgentCompaction(evt) {").strip()
+    script = tmp_path / "agent_compaction_handler_harness.mjs"
+    script.write_text(
+        "const handleAgentCompaction = function "
+        + handler
+        + r""";
+
+let ensureCalls = 0;
+let resets = 0;
+function resetCompactionHolder(holder) {
+  resets += 1;
+  holder.card = null;
+  holder.cid = null;
+}
+const pane = {
+  _agentCompactions: new Map(),
+  _agentTransientRoute() { return { state: "current", row: null }; },
+  _ensureAgentCard() {
+    ensureCalls += 1;
+    return {};
+  },
+  _syncAgentCompaction(parentId) {
+    const holder = this._agentCompactions.get(parentId);
+    const evt = holder && holder.pending;
+    if (!evt) return;
+    holder.pending = null;
+    if (evt.phase === "start") {
+      holder.card = {};
+      holder.cid = String(evt.compaction_id);
+    } else if (
+      evt.phase === "end" &&
+      (holder.cid == null || String(evt.compaction_id) === holder.cid)
+    ) {
+      resetCompactionHolder(holder);
+    }
+  },
+  _handleAgentCompaction: handleAgentCompaction,
+};
+
+pane._handleAgentCompaction({
+  phase: "end", parent_call_id: "task-A", compaction_id: 9, ok: true,
+});
+if (pane._agentCompactions.size !== 0 || ensureCalls !== 0)
+  throw new Error("orphan end manufactured task state");
+
+pane._handleAgentCompaction({
+  phase: "start", parent_call_id: "task-A", compaction_id: 12,
+});
+const live = pane._agentCompactions.get("task-A");
+if (!live || live.cid !== "12" || !live.card)
+  throw new Error("start did not establish attempt 12");
+
+pane._handleAgentCompaction({
+  phase: "end", parent_call_id: "task-A", compaction_id: 11, ok: true,
+});
+if (pane._agentCompactions.get("task-A") !== live || live.cid !== "12" || !live.card)
+  throw new Error("stale end retired attempt 12");
+
+pane._handleAgentCompaction({
+  phase: "end", parent_call_id: "task-A", compaction_id: 12, ok: true,
+});
+if (pane._agentCompactions.size !== 0 || live.card !== null || live.cid !== null)
+  throw new Error("owning end did not retire attempt 12");
+if (resets !== 2) throw new Error("unexpected reset count: " + resets);
+""",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        ["node", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert proc.returncode == 0, f"agent compaction harness failed:\n{proc.stderr}\n{proc.stdout}"
+
+
+def test_recycled_parent_compaction_waits_for_successor_occurrence(tmp_path: Path) -> None:
+    """Compaction and context share one terminal-occurrence gate."""
+
+    import shutil
+    import subprocess
+
+    if shutil.which("node") is None:
+        pytest.skip("node binary not available on PATH")
+
+    body = _INTERACTIVE.read_text(encoding="utf-8")
+    route = _extract_braced(body, "  _agentTransientRoute(parentId) {").strip()
+    handler = _extract_braced(body, "  _handleAgentCompaction(evt) {").strip()
+    relink = _extract_braced(body, "  _relinkAgentCards(items) {").strip()
+    script = tmp_path / "agent_compaction_occurrence_harness.mjs"
+    script.write_text(
+        "const agentTransientRoute = function "
+        + route
+        + ";\nconst handleAgentCompaction = function "
+        + handler
+        + ";\nconst relinkAgentCards = function "
+        + relink
+        + r""";
+
+function resetCompactionHolder(holder) {
+  holder.card = null;
+  holder.cid = null;
+}
+const oldRow = { name: "old" };
+const successorRow = { name: "successor" };
+const uniqueRow = { name: "unique" };
+let parentRow = oldRow;
+const attached = [];
+const pane = {
+  busy: true,
+  _agentCards: new Map(),
+  _agentContexts: new Map(),
+  _agentCompactions: new Map(),
+  _toolResultNodes: new Map([["task-A", { row: oldRow }]]),
+  _toolRow() { return parentRow; },
+  _agentTransientRoute: agentTransientRoute,
+  _handleAgentCompaction: handleAgentCompaction,
+  _relinkAgentCards: relinkAgentCards,
+  _ensureAgentCard(parentId) {
+    if (!parentRow) return null;
+    attached.push(parentRow);
+    const card = { wrap: { dataset: { state: "running" } } };
+    this._syncAgentCompaction(parentId, card);
+    return card;
+  },
+  _syncAgentCompaction(parentId) {
+    const holder = this._agentCompactions.get(parentId);
+    if (!holder || !holder.pending || holder.blockedByTerminalRow) return;
+    const evt = holder.pending;
+    holder.pending = null;
+    if (evt.phase === "start") {
+      holder.card = {};
+      holder.cid = String(evt.compaction_id);
+    }
+  },
+  _flushAgentOrphans() {},
+};
+
+pane._handleAgentCompaction({
+  phase: "start", parent_call_id: "task-A", compaction_id: 1,
+});
+const blocked = pane._agentCompactions.get("task-A");
+if (!blocked || blocked.blockedByTerminalRow !== oldRow || attached.length !== 0)
+  throw new Error("recycled id attached compaction to the terminal occurrence");
+
+parentRow = successorRow;
+pane._relinkAgentCards([{ call_id: "task-A" }]);
+if (attached.length !== 1 || attached[0] !== successorRow)
+  throw new Error("successor occurrence did not receive buffered compaction");
+if (blocked.blockedByTerminalRow || blocked.cid !== "1" || !blocked.card)
+  throw new Error("buffered compaction did not activate on successor row");
+
+pane._agentCompactions.clear();
+pane._toolResultNodes.clear();
+parentRow = null;
+pane._handleAgentCompaction({
+  phase: "start", parent_call_id: "task-B", compaction_id: 2,
+});
+if (attached.length !== 1)
+  throw new Error("unique pre-parent event attached without a row");
+parentRow = uniqueRow;
+pane._relinkAgentCards([{ call_id: "task-B" }]);
+if (attached.length !== 2 || attached[1] !== uniqueRow)
+  throw new Error("unique id control did not attach when its row painted");
+""",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        ["node", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert proc.returncode == 0, f"occurrence harness failed:\n{proc.stderr}\n{proc.stdout}"
 
 
 def test_idless_agent_context_snapshot_relinks_after_parent_runtime(tmp_path: Path) -> None:
@@ -1537,8 +1882,10 @@ let attached = 0;
 const pane = {
   busy: true,
   _agentContexts: new Map(),
+  _agentCompactions: new Map(),
   _toolResultNodes: new Map(),
   _toolRow() { return parentRow; },
+  _agentTransientRoute() { return { state: "current", row: parentRow }; },
   _ensureAgentCard(parentId, contextOnly) {
     if (!parentRow) return null;
     const reading = this._agentContexts.get(parentId);
