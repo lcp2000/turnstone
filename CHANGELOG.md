@@ -12,119 +12,142 @@ that minor, so the current stable line never has two independently writable
 branches. Earlier stable lines (`stable/1.7`, `stable/1.6`, `stable/1.5`) are
 frozen.
 
-## [Unreleased]
+## [1.8.2]
+
+Turnstone 1.8.2 moves model endpoints entirely into model definitions and
+retires the server's bootstrap endpoint flags, fixes MCP OAuth discovery for
+servers and issuers whose identity carries a path, teaches `web_fetch` to read
+PDFs, and gives every tool result one honest size limit. It includes no
+database schema migrations. Operators who start `turnstone-server` with
+`--base-url`, `--api-key`, `--provider` or `--model`, or who still carry an
+`[api]` section in `config.toml`, should read the **Removed** section before
+upgrading.
 
 ### Added
 
+- **Claude Fable 5.1 (#1076).** The Anthropic lane knows `claude-fable-5-1`:
+  1M context, 128K output, adaptive thinking, the full effort ladder, web
+  search, tool search, vision, PDF and mid-conversation system messages. New
+  Anthropic organizations reject replayed thinking that predates an edit to
+  the conversation prefix; Turnstone opts into the documented degrade mode,
+  so such blocks are dropped server-side and unbilled and the request
+  proceeds instead of failing.
+- **PDF support in `web_fetch` (#1055).** A fetched response that is a PDF
+  is read the same way an attached PDF is: natively when the active model
+  accepts documents, as page images for a vision model, through configured
+  perception, and otherwise by local text extraction in an isolated worker
+  bounded by memory, CPU, wall time and output size. When none of those can
+  read the document the tool returns an explicit error instead of answering
+  from an empty page. Fetched PDFs are request-local and never enter
+  conversation history or attachment storage. Hardened containers need a
+  writable `/tmp` and a seccomp policy that permits the worker's
+  process-and-limit syscalls; see `docs/tools.md`.
 - **MCP OAuth discovery for servers on a private network.** The new
   `mcp.oauth_allow_private_network` setting (console Settings → MCP,
   default off) lets an MCP server at an internal address complete OAuth
   discovery. It applies only to what the operator typed on the row — the
-  server URL that metadata locations are derived from, and the
-  authorization-server override — so an authorization server named by a
-  fetched document is still refused when it is private. The switch itself is
-  deployment-wide and relaxes the address check for every OAuth MCP server.
-  A hostname resolving to both public and private addresses is refused
-  regardless, as are cloud metadata, link-local, multicast and reserved
-  addresses, and the `https://` requirement for per-user bearers is
-  unchanged. A refusal names the remedy that actually applies to it.
+  server URL and the authorization-server override — so an authorization
+  server named by a fetched document is still refused when it is private,
+  and a remote server cannot reach into the deployment's own network. Cloud
+  metadata, link-local, multicast and reserved addresses stay refused, and
+  per-user bearers still require `https://`. A refusal names the setting
+  that would allow it.
 
 ### Changed
 
+- **One size limit for tool results (#1075).** Every place a tool result,
+  web page, search snippet, skill clip or reasoning display was cut now
+  uses the same rule: the limit includes its marker, and the marker
+  reports how much the producer actually returned rather than blaming the
+  limit. In automatic mode each result receives 20% of the batch's
+  remaining input budget, capped at 20% of the context window, and the
+  `tools.truncation` help text says so. Long `bash` and `diff_file`
+  output keeps its head and tail edges rather than buffering the whole
+  capture. A `bash_output` read returns whole lines up to the cap and reports
+  how many remain unread for the next call. A stored setting outside a
+  range the registry has since tightened is clamped on load with a
+  warning, and shown clamped in the admin listing, instead of silently
+  reverting to the default.
 - **A model definition that leaves `api_key` empty on a local server**
   (`openai-compatible` / `anthropic-compatible`) resolves its bearer the way
-  the server's own `--api-key` default used to: the SDK's environment
-  variable when set, otherwise a placeholder, so vLLM and llama.cpp
-  definitions keep working without an exported `OPENAI_API_KEY`. Commercial
-  providers keep the SDK environment-variable rule unchanged.
-- **`turnstone-doctor` resolves its own model the way a node does** — from
-  the database definitions and `[models.*]` — instead of seeding one from
-  `[api]` / `LLM_BASE_URL`, which a node no longer reads.
+  the server's old `--api-key` default did: the SDK's environment variable
+  when set, otherwise a placeholder, so vLLM and llama.cpp definitions keep
+  working without an exported `OPENAI_API_KEY`. Commercial providers keep
+  the SDK environment-variable rule unchanged.
+- **`turnstone-doctor` resolves its own model the way a node does**, from
+  the database definitions and `[models.*]`, instead of seeding one from
+  `[api]`, which a node no longer reads.
 - **A `[models.*]` entry that names neither `base_url` nor `provider`** is
   skipped with a startup warning. It used to inherit the server's bootstrap
-  endpoint; without one, the default provider would send its prompts to the
-  commercial OpenAI API.
+  endpoint; without one, the default provider would have sent its prompts
+  to the commercial OpenAI API.
 
 ### Removed
 
 - **`turnstone-server` no longer takes `--base-url`, `--api-key`,
-  `--provider`, or `--model`, and no longer reads `[api]` from
-  `config.toml`.** Model endpoints live in the console Models tab and in
-  `[models.*]` entries, each with its own `base_url` and `api_key`; a server
-  started with nothing configured boots with an empty registry and picks
-  models up live from the console. `compose.yaml` drops the `LLM_BASE_URL`
-  and `MODEL` variables, the Helm chart drops `llm.baseUrl` / `llm.provider`
-  (their environment variables were read by nothing), and the Terraform
-  module drops `llm_base_url`. A `config.toml` that still carries `[api]`
-  gets a startup warning naming the replacement. The `turnstone` CLI keeps
-  its flags.
+  `--provider` or `--model`, and no longer reads `[api]` from
+  `config.toml` (#1052).** Model endpoints live in the console Models tab
+  and in `[models.*]` entries, each with its own `base_url` and `api_key`.
+  A server started with nothing configured boots with an empty registry
+  and picks models up live from the console. `compose.yaml` drops the
+  `LLM_BASE_URL` and `MODEL` variables, the Helm chart drops
+  `llm.baseUrl` / `llm.provider` (nothing read their environment
+  variables), and the Terraform module drops `llm_base_url`. A
+  `config.toml` that still carries `[api]` gets a startup warning naming
+  the replacement. The `turnstone` CLI keeps its flags for now (#1085).
 
 ### Fixed
 
 - **Context window auto-detection (#1052).** A model definition whose
-  `context_window` is `0` is now resolved per definition: from the
-  provider's capability table for Anthropic, OpenAI and xAI, and by asking
-  the definition's own endpoint for local servers and gateways (vLLM
-  `max_model_len`, llama.cpp `n_ctx_train`, and the `context_length`,
-  `context_window` or `max_context_length` that OpenRouter, Together,
-  Fireworks, Groq and Mistral report) — at startup and on every
-  hot-reload, identical
-  definitions sharing one probe; when a reload's probe fails, a definition
-  the running registry had detected on the same endpoint and model keeps
-  that window, so a backend mid-restart never shrinks live sessions. The
-  server, the console and the doctor resolve the same way. Previously every
-  such definition inherited the window the server had detected on its
-  bootstrap endpoint at boot — 32768 whenever `--model` was passed or that
-  endpoint was unreachable, and the wrong endpoint's number otherwise. A
-  definition that cannot be resolved — a model id the capability table does
-  not list (every Google model, which has no table), an unreachable or
-  silent endpoint — falls back to 32768 with a startup warning naming the
-  alias and the reason. Probes run concurrently under a five-second budget.
-  A definition created through the admin API without a `context_window` is
-  stored as auto-detect rather than a literal 32768. A local-server
-  definition without a `base_url` is refused at save time and skipped at
-  load time, and a `[models.*]` entry with `provider = "openai"` and no
-  `base_url` is skipped while the file still carries `[api] base_url`,
-  since it was written to inherit that endpoint. The console Detect button
-  no longer offers a commercial model's window for a local server, and when
-  the endpoint reports no window it fills the field with the 32768 the node
-  would otherwise use, and says so, so the operator corrects it before the
-  first call rather than finding it in the node log. Node
-  hot-reloads are serialised and keep the running registry when the load
-  fails.
+  `context_window` is `0` used to inherit whatever window the server had
+  detected on its bootstrap endpoint at boot: 32768 whenever `--model` was
+  passed or that endpoint was unreachable, and the wrong endpoint's number
+  otherwise. It is now resolved per definition, at startup and on every
+  hot-reload: from the provider capability table for Anthropic, OpenAI and
+  xAI, and by asking the definition's own endpoint for local servers and
+  gateways (vLLM, llama.cpp, OpenRouter, Together, Fireworks, Groq and
+  Mistral all report it). Identical definitions share one probe, probes run
+  concurrently under a five-second budget, and when a reload's probe fails
+  the window the running registry already detected is kept, so a backend
+  mid-restart never shrinks live sessions. A definition that cannot be
+  resolved falls back to 32768 with a startup warning naming the alias and
+  the reason. The server, the console and the doctor resolve identically.
+  The console Detect button no longer offers a commercial model's window
+  for a local server, and when the endpoint reports none it fills in the
+  32768 the node would use and says so. A definition created through the
+  admin API without a `context_window` is stored as auto-detect rather than
+  a literal 32768, a local-server definition without a `base_url` is
+  refused at save time, and node hot-reloads are serialised and keep the
+  running registry when a load fails.
 - **MCP OAuth discovery for servers and issuers with paths (#1061, #1063).**
-  Protected-resource metadata is fetched from the RFC 9728 path-specific
-  location first and the origin-level location second, in one candidate loop
-  that advances past any unusable response and follows one
-  `WWW-Authenticate` challenge per location. Each document must declare the
-  identifier its own URL was derived from: the canonical RFC 8707
-  identifier at the path-specific location, the bare origin at the
-  origin-level one, parsed strictly rather than with the leniency that
-  heals an older stored row, and refused outright when the raw identifier
-  carries characters URL parsing would silently drop. Comparison folds scheme and host case, the
-  default port, and a root-only trailing slash.
-  Authorization-server metadata is tried at the locations MCP lists — the
-  RFC 8414 document with the well-known segment inserted, then the OpenID
-  Connect document inserted, then appended — followed by an appended-form
-  RFC 8414 compatibility probe, and a candidate wins only after its whole
+  A server or authorization server whose identity carries a path never
+  resolved, because metadata URLs kept only the origin. Protected-resource
+  metadata is now tried at the RFC 9728 path-specific location first and
+  the origin-level location second, following one `WWW-Authenticate`
+  challenge per location, and each document must declare the identifier
+  its own URL was derived from. Authorization-server metadata is tried at
+  the locations MCP lists, and a candidate wins only after its whole
   document validates, so a catch-all response cannot shadow the document
   that describes the issuer. A document whose `issuer` does not match the
-  requested one — identically, since a trailing slash makes a different
-  identifier — is skipped rather than trusted; a templated issuer, which
-  multi-tenant providers publish on their tenant-agnostic document, is
-  accepted and logged, with the placeholder confined to whole path segments
-  and never to the scheme or authority. Discovery runs under one wall-clock
-  budget.
-  User-scoped MCP server rows store the canonical URL, a spelling-only
-  change no longer purges user tokens, and a Server URL or Authorization
-  Server URL change clears the cached issuer. Changing the Authorization
-  Server URL on a user-scoped row now also purges that server's per-user
-  grants and pending consents, since the stored refresh tokens were issued
-  by the previous authorization server, and clears a dynamically registered
-  client id, which the previous server issued and the new one will not
-  honour. Every MCP OAuth HTTP client
-  sends `Accept: application/json` by default, so token endpoints that
-  content-negotiate return JSON on every grant leg.
+  requested one is skipped; the templated issuer that multi-tenant
+  providers publish is accepted and logged. Discovery runs under one
+  wall-clock budget. User-scoped server rows store the canonical URL, so a
+  spelling-only change no longer purges user tokens, and every MCP OAuth
+  request asks for JSON so a content-negotiating token endpoint returns it
+  on every grant leg.
+- **Changing a server's authorization server now purges its grants.**
+  Pointing a user-scoped MCP row at a different Authorization Server URL
+  left every per-user grant and pending consent in place, so the next
+  refresh presented tokens issued by the previous server to the new one.
+  The change now purges those rows, so users re-consent against the server
+  now configured, and clears a dynamically registered client id the
+  previous server issued. A pre-registered client id is left alone.
+- **CLI startup failed with a retired-workstream error (#1058).** The
+  interactive `turnstone` CLI reserved a workstream id and then built its
+  session under a different one, so a fresh session could die during
+  construction with `workstream ... was retired`. The reserved id is now
+  carried through, and a subprocess test starts the CLI against a fresh
+  database on every run.
 
 ## [1.8.1]
 
