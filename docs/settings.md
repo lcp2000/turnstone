@@ -256,7 +256,7 @@ connection, Redis, auth secrets, server bind address). These stay in
 
 | Category | Section | Where |
 |----------|---------|-------|
-| API credentials | `[api]` | config.toml / env |
+| API credentials (CLI only) | `[api]` | config.toml / env — the server takes endpoints from model definitions |
 | Database | `[database]` | config.toml / env |
 | Auth | `[auth]` | config.toml / env |
 | Console bind | `[console]` | config.toml / env |
@@ -271,7 +271,7 @@ initialization:
 | `tools` | timeout, approval_timeout_seconds, truncation, agent_max_turns, skip_permissions, search, search_threshold, search_max_results |
 | `server` | workstream_idle_timeout, max_workstreams |
 | `cluster` | node_fan_out_limit, mcp_max_servers |
-| `mcp` | config_path, registry_url |
+| `mcp` | config_path, registry_url, oauth_allow_private_network |
 | `ratelimit` | enabled, requests_per_second, burst, trusted_proxies |
 | `health` | backend_probe_interval, backend_probe_timeout, circuit_breaker_threshold, circuit_breaker_cooldown |
 | `judge` | enabled, model, smart_approvals, confidence_threshold, max_context_ratio, timeout, parallel_evaluations, read_only_tools, output_guard, output_guard_budget_seconds, output_guard_llm, output_guard_model, output_guard_llm_timeout, redact_secrets, cancel_on_approval |
@@ -282,6 +282,12 @@ initialization:
 Settings are addressed by dotted key (e.g. `memory.relevance_k`). Each has a
 declared type (`int`, `float`, `str`, `bool`), optional `min_value`/`max_value`
 range, optional `choices` list, and an `is_secret` flag.
+
+A stored value outside a setting's range is clamped to the nearest bound when
+settings load, with a warning, so a bound tightened by an upgrade never
+silently replaces an operator's choice with the default. Values of the wrong
+type or outside a `choices` list are skipped with a warning and the default
+applies.
 
 ---
 

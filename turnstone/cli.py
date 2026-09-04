@@ -1130,7 +1130,10 @@ def main() -> None:
         "--tool-truncation",
         type=int,
         default=0,
-        help="Tool output truncation limit in chars, 0 for auto (50%% of context window) (default: 0)",
+        help=(
+            "Tool output truncation limit in chars, 0 for auto "
+            "(20%% of the remaining input budget per result) (default: 0)"
+        ),
     )
     parser.add_argument(
         "--tool-search",
@@ -1425,6 +1428,7 @@ def main() -> None:
             registry_generation=registry_generation,
             model_alias=effective_alias,
             model_binding=model_binding,
+            ws_id=ws_id,
             tool_search=args.tool_search,
             tool_search_threshold=args.tool_search_threshold,
             tool_search_max_results=args.tool_search_max_results,

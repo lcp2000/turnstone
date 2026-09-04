@@ -5477,7 +5477,7 @@ def _load_and_bootstrap_coord_subsystem(app: Starlette, storage: Any, config_sto
     coord_registry: Any | None = None
     try:
         try:
-            coord_registry = load_model_registry(storage=storage)
+            coord_registry = load_model_registry(storage=storage, detect_context_windows=True)
         except ValueError as exc:
             # No model rows configured.  Endpoint returns 503 with the
             # error text so admin sees remediation in the UI; the
@@ -9825,7 +9825,7 @@ async def admin_list_settings(request: Request) -> JSONResponse:
         row = stored.get(key)
         if row:
             try:
-                val = deserialize_value(key, row["value"])
+                val = deserialize_value(key, row["value"], clamp_range=True)
             except (ValueError, KeyError):
                 val = row["value"]
             info = {
@@ -10432,6 +10432,51 @@ def _enforce_oauth_user_https(auth_type: str, url: str | None) -> JSONResponse |
     return None
 
 
+def _canonical_oauth_user_url(
+    auth_type: str | None, url: str, *, strict: bool = True
+) -> tuple[str, JSONResponse | None]:
+    """Canonicalize the MCP server URL for a user-scoped row at the write boundary.
+
+    Returns ``(url, None)`` unchanged for other auth types and for an empty
+    URL (presence is checked elsewhere). For ``oauth_user`` and
+    ``oauth_obo`` the stored value becomes the canonical RFC 8707 resource
+    identifier that discovery and every token request use, so the row
+    shows the value that goes on the wire, and a fragment or embedded
+    credentials are a 400 here with a plain message instead of an opaque
+    ``mcp_oauth_error`` redirect at the first consent.
+
+    *strict* is on whenever the request supplies the URL, so the operator
+    is told to fix what they typed. It is off when this write only inherits
+    an existing row's URL: an edit to some other field must not be refused
+    because the row predates this validation, so the stored value is healed
+    in place instead.
+    """
+    if not is_user_scoped_auth(auth_type) or not url:
+        return url, None
+    from turnstone.core.mcp_oauth import canonical_resource
+
+    try:
+        return canonical_resource(url, strict=strict), None
+    except ValueError as exc:
+        return url, JSONResponse({"error": f"url: {exc}"}, status_code=400)
+
+
+def _same_oauth_resource(existing_url: str, new_url: str) -> bool:
+    """True when two server URLs name the same RFC 8707 resource.
+
+    A stored value that predates canonicalization compares by canonical
+    form, so a spelling-only rewrite (host case, default port, root slash)
+    is not a URL change. A stored value that cannot be canonicalized
+    compares byte-for-byte, as it did before.
+    """
+    from turnstone.core.mcp_oauth import canonical_resource
+
+    try:
+        return canonical_resource(existing_url) == canonical_resource(new_url)
+    except ValueError:
+        return existing_url == new_url
+
+
 def _obo_profile(request: Request) -> str:
     """Deployment-level ``[oidc] obo_grant_profile`` (``""`` when OIDC absent).
 
@@ -11011,8 +11056,14 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
     clean_audience = _clean_oauth_text(body.get("oauth_audience"), max_length=2048)
     clean_scopes = _clean_oauth_text(body.get("oauth_scopes"))
 
+    # A user-scoped row stores its URL in canonical RFC 8707 form (the value
+    # discovery and every token request use); other rows keep the typed value.
+    server_url, err_resp = _canonical_oauth_user_url(auth_type, str(body.get("url", "")).strip())
+    if err_resp is not None:
+        return err_resp
+
     # sec-1: oauth_user/oauth_obo must use https:// (loopback http allowed for dev).
-    err_resp = _enforce_oauth_user_https(auth_type, str(body.get("url", "")).strip())
+    err_resp = _enforce_oauth_user_https(auth_type, server_url)
     if err_resp is not None:
         return err_resp
 
@@ -11079,7 +11130,7 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
         transport=transport,
         command=str(body.get("command", "")).strip(),
         args=json.dumps(args_list) if isinstance(args_list, list) else "[]",
-        url=str(body.get("url", "")).strip(),
+        url=server_url,
         headers=json.dumps(headers_dict) if isinstance(headers_dict, dict) else "{}",
         env=json.dumps(env_dict) if isinstance(env_dict, dict) else "{}",
         auto_approve=bool(body.get("auto_approve", False)),
@@ -11298,6 +11349,19 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
             ):
                 updates[_user_col] = updates.get(_user_col)
     updates.update(_oauth_columns_to_clear(target_auth))
+    # A user-scoped row stores its URL in canonical RFC 8707 form, judged on
+    # the post-update auth type and applied to the merged URL, so a flip into
+    # oauth_user that omits ``url`` canonicalizes (or rejects) the stored value
+    # exactly as a create would.
+    if is_user_scoped_auth(target_auth):
+        merged_url = str(updates.get("url", existing.get("url")) or "")
+        canonical_url, err_resp = _canonical_oauth_user_url(
+            target_auth, merged_url, strict="url" in updates or is_flip
+        )
+        if err_resp is not None:
+            return err_resp
+        if "url" in updates or canonical_url != merged_url:
+            updates["url"] = canonical_url
     # Renaming a pool-backed row needs the same per-user-token purge as
     # delete: the tokens are keyed on the OLD ``server_name`` and a row
     # later created with that old name (with attacker-controlled URL)
@@ -11314,11 +11378,36 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     # mint/consent time, so sending them to a new URL is a token-binding
     # violation. A compromised admin who flips the URL to an attacker
     # endpoint would otherwise replay every user's bearer there silently.
+    # Compared by resource, not by spelling: the first re-save of a row stored
+    # before canonicalization rewrites `https://Host/` to `https://host` and
+    # must not read as a target change that purges every user's tokens.
     url_changing = (
         is_user_scoped_auth(old_auth)
         and "url" in updates
-        and existing.get("url", "") != updates["url"]
+        and not _same_oauth_resource(str(existing.get("url") or ""), updates["url"])
     )
+    # The cached AS issuer was discovered from the URL and the AS override
+    # the row had at the time; a change to either makes it describe a
+    # different row, and nothing else ever clears it.
+    as_url_changing = "oauth_authorization_server_url" in body and (
+        updates.get("oauth_authorization_server_url") or None
+    ) != (existing.get("oauth_authorization_server_url") or None)
+    if url_changing or as_url_changing:
+        updates["oauth_as_issuer_cached"] = None
+    # Pointing a row at a different authorization server is a token-binding
+    # change like a URL change: the stored refresh tokens were issued by the
+    # OLD authorization server, and the next refresh would present them to the
+    # new one. A dynamically registered client_id has the same problem — it
+    # was issued by the old server and means nothing at the new one — so it is
+    # cleared too, letting registration run again. A pre-registered client_id
+    # is the operator's own value and is left alone.
+    as_url_purge = as_url_changing and is_user_scoped_auth(old_auth)
+    if as_url_purge:
+        registration_mode = str(
+            updates.get("oauth_registration_mode", existing.get("oauth_registration_mode")) or ""
+        )
+        if registration_mode == "dynamic":
+            updates["oauth_client_id"] = None
     # Changing oauth_audience on a pool-backed row is a token-binding change too:
     # minted obo bearers (and oauth_user tokens) are audience-scoped, so cached
     # rows for the OLD audience must be purged or a privilege reduction silently
@@ -11397,7 +11486,14 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     # URL/audience/scope set (the OAuth tables key on the mutable
     # ``server_name`` and tokens are bound to the URL + audience + scopes
     # active at mint/consent time).
-    if name_changing or auth_type_purge or url_changing or audience_changing or scopes_changing:
+    if (
+        name_changing
+        or auth_type_purge
+        or url_changing
+        or as_url_purge
+        or audience_changing
+        or scopes_changing
+    ):
         purge_target = existing.get("name", "")
         if purge_target:
             try:
@@ -12761,7 +12857,12 @@ def _refresh_coord_registry_locked(app_state: Any, storage: Any) -> None:
         # Without it, the loader degrades to a config.toml-only registry
         # and ``existing.reload()`` would silently drop every DB-sourced
         # alias.
-        new_registry = load_model_registry(storage=storage, strict=True)
+        new_registry = load_model_registry(
+            storage=storage,
+            strict=True,
+            detect_context_windows=True,
+            prior=existing.models,
+        )
     except ValueError as exc:
         # ModelRegistry.__init__ raises ValueError for several distinct
         # config issues — empty models, default/fallback/agent/task
@@ -12857,7 +12958,7 @@ def _maybe_bootstrap_coord_subsystem(app: Any, storage: Any) -> None:
         if getattr(app.state, "coord_mgr", None) is not None:
             return
         try:
-            coord_registry = load_model_registry(storage=storage)
+            coord_registry = load_model_registry(storage=storage, detect_context_windows=True)
         except ValueError as exc:
             # Still no usable rows (e.g. all disabled).  Surface the
             # reason via the same channel the lifespan path uses so
@@ -13118,9 +13219,18 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
             {"error": f"Unknown provider: {provider!r}"},
             status_code=400,
         )
+    from turnstone.core.providers import LOCAL_PROVIDERS
+
     base_url = str(body.get("base_url", "")).strip()
+    if provider in LOCAL_PROVIDERS and not base_url:
+        # Fully knowable at save time; without it the SDK client would target
+        # the provider's public endpoint (create_client refuses, but only on
+        # the first turn, as a per-user construction error).
+        return JSONResponse(
+            {"error": f"base_url is required for provider {provider!r}"}, status_code=400
+        )
     api_key = str(body.get("api_key", "")).strip()
-    ctx_raw = body.get("context_window", 32768)
+    ctx_raw = body.get("context_window", 0)  # omitted = auto-detect
     # json admits NaN/Infinity literals, which pass the isinstance check but
     # crash int(); refuse non-finite floats as invalid values instead.
     if isinstance(ctx_raw, float) and not math.isfinite(ctx_raw):
@@ -13361,6 +13471,25 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         updates["provider"] = prov
     if "base_url" in body:
         updates["base_url"] = str(body["base_url"]).strip()
+    if "provider" in body or "base_url" in body:
+        # Only a request that chooses the endpoint is refused for it; an
+        # unrelated update (enabled, alias) to an older row still goes through.
+        from turnstone.core.providers import LOCAL_PROVIDERS
+
+        effective_provider = updates.get("provider", existing.get("provider", "openai"))
+        effective_base_url = updates.get("base_url", existing.get("base_url", ""))
+        stored_url = str(existing.get("base_url") or "")
+        # provider "openai" with a non-OpenAI host is a local server too — the
+        # loader reclassifies it at load time — so blanking that host would
+        # retarget the row to the commercial API.
+        was_local = bool(stored_url) and "api.openai.com" not in stored_url
+        if not effective_base_url and (
+            effective_provider in LOCAL_PROVIDERS or (effective_provider == "openai" and was_local)
+        ):
+            return JSONResponse(
+                {"error": f"base_url is required for provider {effective_provider!r}"},
+                status_code=400,
+            )
     if "api_key" in body:
         api_key = str(body["api_key"]).strip()
         # Sentinel "***" or empty string means "keep existing"
@@ -13792,10 +13921,29 @@ async def admin_detect_model(request: Request) -> JSONResponse:
     ):
         return JSONResponse({"error": "api_key is required"}, status_code=400)
 
+    from turnstone.core.providers import LOCAL_PROVIDERS
+
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(
-        None, probe_model_endpoint, provider, base_url, api_key, model
+        None,
+        functools.partial(
+            probe_model_endpoint,
+            provider,
+            base_url,
+            api_key,
+            model,
+            # A local server serving a commercial model id must not be shown
+            # (and then saved with) that model's commercial window; the
+            # registry loader applies the same rule.
+            static_table=provider not in LOCAL_PROVIDERS,
+        ),
     )
+    if result.get("reachable") and result.get("context_window") is None:
+        # Tell the form what the node would run with, so the operator sees
+        # the number before the first call instead of in the node log.
+        from turnstone.core.model_registry import FALLBACK_CONTEXT_WINDOW
+
+        result["fallback_context_window"] = FALLBACK_CONTEXT_WINDOW
     return JSONResponse(result)
 
 
@@ -14589,7 +14737,7 @@ async def admin_list_judge_settings(request: Request) -> JSONResponse:
         row = stored.get(key)
         if row:
             try:
-                val = deserialize_value(key, row["value"])
+                val = deserialize_value(key, row["value"], clamp_range=True)
             except (ValueError, KeyError):
                 val = row["value"]
             entry = {

@@ -43,14 +43,48 @@ Switching `auth_type` away from `oauth_user` / `oauth_obo` **deletes** that serv
 
 | Field | Required | Description |
 |---|---|---|
-| Server URL | Yes | The MCP server's `streamable-http` base URL. |
+| Server URL | Yes | The MCP server's `streamable-http` base URL. For `oauth_user` and `oauth_obo` rows it is stored in canonical form (lower-case scheme and host, default port dropped, a root-only trailing slash dropped, the path otherwise kept exactly as typed) and that value is the RFC 8707 `resource=` sent on every authorize and token request. A fragment or embedded credentials is rejected at save; a row stored before that check keeps working, with both stripped from the identifier at use. |
 | Multitenant Authorization | Yes | `none` / `static` / `oauth_user` (recommended). |
-| Authorization Server URL | No | Override for RFC 9728 PRM discovery. Set when your AS endpoint differs from the MCP server URL (e.g., corporate AS protecting a third-party MCP). When unset, Turnstone falls back to PRM discovery against the MCP server itself. |
+| Authorization Server URL | No | Override for RFC 9728 PRM discovery. Set when your AS endpoint differs from the MCP server URL (e.g., corporate AS protecting a third-party MCP). When unset, Turnstone fetches the server's protected-resource metadata from the RFC 9728 path-specific location first and the origin-level location second, and follows one `WWW-Authenticate` `resource_metadata` challenge per location. Each document must declare the identifier its own URL was derived from — the canonical Server URL at the path-specific location, the bare origin at the origin-level one — so a server that publishes only at the origin while declaring its path-bearing URL needs this override instead. Authorization-server metadata is then tried at the locations MCP lists (RFC 8414 inserted, OpenID Connect inserted, OpenID Connect appended) followed by an appended-form RFC 8414 compatibility probe, and a location wins only after its whole document validates. A document whose `issuer` is not identical to the one requested is skipped — a trailing slash makes it a different identifier, so set this field to the exact spelling the AS publishes; a templated issuer (`{tenantid}`) is accepted and logged. An issuer with a query string or fragment is refused. The resolved issuer is cached on the row and cleared whenever this field or the Server URL changes. Changing this field also purges the server's per-user grants and pending consents — the stored refresh tokens were issued by the previous authorization server — and clears a dynamically registered client id. |
 | Client Registration | Yes (oauth_user) | `preregistered` or `dynamic`. |
 | Client ID | Yes (preregistered) | OAuth 2.0 client ID. Stored unencrypted. |
 | Client Secret | Optional (write-only) | OAuth 2.0 client secret (confidential client). Encrypted at rest. Written but never re-read by the API; field stays masked. |
 | Scopes | No | Space-separated default scope set requested at the authorize endpoint. Per-tool step-up may union additional scopes from a server's `insufficient_scope` response. |
-| Audience | No | RFC 8707 `resource=` parameter sent on every authorize and token request. Defaults to the MCP server URL when unset. Validate against the `aud` claim in returned JWT tokens. |
+| Audience | No | The `audience=` parameter some authorization servers use instead of RFC 8707 `resource=` (which always carries the canonical Server URL). Defaults to the Server URL as stored. A returned JWT's `aud` claim is accepted if it matches either value. |
+
+### MCP servers on a private network
+
+Discovery refuses private and internal addresses by default, so an MCP
+server at `https://mcp.internal.example/mcp` fails at the first
+protected-resource metadata fetch. Enable **`mcp.oauth_allow_private_network`**
+(console Settings → MCP) to allow it. The opt-in is deliberately narrow:
+
+- it applies to what you typed on the server row — the **Server URL** that
+  metadata locations are derived from, and the **Authorization Server URL**
+  override;
+- an authorization server named by a document Turnstone fetched is still
+  refused when it is private, so a remote MCP server can never point your
+  deployment at your internal network. A fully internal deployment therefore
+  sets the Authorization Server URL override rather than relying on the MCP
+  server's metadata to name it;
+- cloud metadata endpoints and link-local, multicast and reserved addresses
+  stay refused with the setting on;
+- the `https://` requirement is unchanged. Per-user bearer tokens must not
+  transit cleartext, so an internal server needs a certificate the deployment
+  trusts — a local CA in the container trust store, or a TLS sidecar in front
+  of the MCP server.
+
+The setting is read per attempt, so flipping it takes effect on the next
+discovery with no restart. It is deployment-wide: it relaxes the address
+check for every `oauth_user` row, including a third-party server whose
+hostname happens to resolve to an internal address of yours. Enable it when
+you trust every OAuth MCP server configured on the deployment.
+
+Nodes learn the new value through a best-effort config-reload fan-out. A node
+that missed it — registered late, or unreachable at the time — keeps the old
+value until it restarts, and its refusals will name a setting the console
+already shows as enabled. Restart that node, or re-save the setting once it is
+reachable.
 
 ### Encryption key
 
@@ -168,6 +202,10 @@ Every transition that changes what a stored row *means* deletes the rows outrigh
 | `mcp_consent_required` even after consenting | Token persistence failed, or refresh-token rejected by AS | Check audit log for `mcp_server.oauth.persist_failed` or `mcp_server.oauth.token_revoked`. Re-consent via settings modal. |
 | `mcp_token_undecryptable_key_unknown` | Encryption key rotated without keeping the previous key in the keyring | Add the previous key back to `mcp_token_encryption_keys` until all rows have been re-encrypted, then drop. |
 | `mcp_oauth_url_insecure` | MCP server URL is `http://` (not `https://`) on a non-loopback host | Use `https://`. Per-user bearers must not transit cleartext. |
+| `PRM resource identifier does not match the server URL` | The server's protected-resource metadata declares a different resource than the row's canonical Server URL (or, at the origin-level location, its origin) | Compare the Server URL path and spelling with what the server publishes at `/.well-known/oauth-protected-resource<path>`. |
+| `AS metadata returned HTTP 404` for an issuer with a path | None of the metadata locations answered | Set the Authorization Server URL override to the issuer exactly as the AS publishes it. A query string or fragment in the issuer is refused with its own message. |
+| `resolves to non-public address` on an internal MCP server | Discovery refuses private addresses by default | Enable `mcp.oauth_allow_private_network` (the error names it). If the refused address is the *authorization server* rather than the MCP server, set the Authorization Server URL override too — an issuer named by a fetched document never gets the opt-in. |
+| `AS metadata issuer does not match the requested issuer` | Every location that answered published a different `issuer` — usually a catch-all response, or an override whose spelling differs from what the AS declares (a trailing slash is a different identifier) | The error names both values; copy the `issuer` from the AS's own metadata document into the Authorization Server URL verbatim. |
 | Tools fail in scheduled / Discord / Slack runs | OAuth-MCP requires browser-based consent | Users must pre-consent via the web UI. Phase 9 dashboard badge surfaces deferred consents from these runs on next login. |
 | Circuit breaker open repeatedly | Transport-level errors on the MCP server (DNS, TLS, 5xx) | Check the per-server error pill; auth errors do not trip the breaker. |
 | **`oauth_obo`**: every tool call fails, log shows `obo_misconfigured` | Server row has no Audience, or `obo_grant_profile` is unset/unknown | Set the Audience on the server row; set `[oidc] obo_grant_profile` to `entra` or `rfc8693`. |
